@@ -1,13 +1,12 @@
 """
-ai_core.py — Production-Ready AI OCR Packing List Extraction Engine
-====================================================================
-Author  : Senior AI Engineer
-Purpose : Extract structured packing list data from images / PDFs
-          using an OCR pre-pass and OpenAI structured completion.
-Usage   :
+ai_core.py — AI OCR Packing List Extraction Engine
+====================================================
+Pure AI extraction module. No backend code.
+
+Usage:
     extractor = PackingListAI()
     result    = extractor.process_file("sample.pdf")
-    print(result)           # dict  — use directly in FastAPI / Django
+    print(result)
 """
 
 from __future__ import annotations
@@ -17,9 +16,7 @@ import io
 import json
 import logging
 import os
-import re
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -56,8 +53,8 @@ class PackingItem(BaseModel):
 
     title: str = Field(..., description="Normalised item name")
     quantity: Optional[int] = Field(None, description="Numeric quantity, null if unknown")
-    is_required: bool = Field(True, description="True when the item is mandatory")
-    note: Optional[str] = Field(None, description="Free-text note or qualifier")
+    is_required: bool = Field(True)
+    note: Optional[str] = Field(None)
 
     @field_validator("title")
     @classmethod
@@ -79,7 +76,7 @@ class PackingCategory(BaseModel):
     """A logical grouping of packing items."""
 
     name: str = Field(..., description="Category label in UPPER CASE")
-    sort_order: int = Field(0, description="Display order index")
+    sort_order: int = Field(0)
     items: list[PackingItem] = Field(default_factory=list)
 
     @field_validator("name")
@@ -89,13 +86,13 @@ class PackingCategory(BaseModel):
 
 
 class PackingList(BaseModel):
-    """Root schema for a fully extracted packing list document."""
+    """Root schema for the full extracted packing list."""
 
-    title: str = Field(..., description="Document title")
-    description: Optional[str] = Field(None)
-    season: Optional[str] = Field(None)
-    trip_type: Optional[str] = Field(None)
-    is_system: bool = Field(True)
+    title: str
+    description: Optional[str] = None
+    season: Optional[str] = None
+    trip_type: Optional[str] = None
+    is_system: bool = True
     categories: list[PackingCategory] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -112,81 +109,38 @@ class PackingList(BaseModel):
 
 class ImagePreprocessor:
     """
-    Applies a series of OpenCV transforms to maximise Tesseract accuracy
-    on real-world, noisy document scans.
+    OpenCV pipeline to clean document images before OCR:
+    grayscale → upscale → denoise → adaptive threshold → deskew
     """
 
-    def __init__(
-        self,
-        dpi_target: int = 300,
-        denoise: bool = True,
-        deskew: bool = True,
-    ) -> None:
-        self.dpi_target = dpi_target
-        self.denoise = denoise
-        self.deskew = deskew
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     def preprocess(self, image: Image.Image) -> Image.Image:
-        """Return a cleaned PIL Image ready for OCR."""
-        img = self._pil_to_cv(image)
-        img = self._to_grayscale(img)
-        img = self._scale_if_needed(img)
-        if self.denoise:
-            img = self._denoise(img)
-        img = self._threshold(img)
-        if self.deskew:
-            img = self._deskew(img)
-        return self._cv_to_pil(img)
-
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _pil_to_cv(image: Image.Image) -> np.ndarray:
-        return cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
-
-    @staticmethod
-    def _cv_to_pil(img: np.ndarray) -> Image.Image:
-        if len(img.shape) == 2:  # grayscale
-            return Image.fromarray(img)
-        return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-
-    @staticmethod
-    def _to_grayscale(img: np.ndarray) -> np.ndarray:
-        return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    def _scale_if_needed(self, img: np.ndarray) -> np.ndarray:
-        """Upscale small images to improve OCR accuracy."""
-        h, w = img.shape[:2]
-        min_dim = 1200  # heuristic for ~300 DPI letter-size page
-        if max(h, w) < min_dim:
-            scale = min_dim / max(h, w)
-            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-            logger.debug("Scaled image by %.2f×", scale)
-        return img
-
-    @staticmethod
-    def _denoise(img: np.ndarray) -> np.ndarray:
-        return cv2.fastNlMeansDenoising(img, h=10)
-
-    @staticmethod
-    def _threshold(img: np.ndarray) -> np.ndarray:
-        return cv2.adaptiveThreshold(
+        img = self._to_cv(image)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        img = self._upscale(img)
+        img = cv2.fastNlMeansDenoising(img, h=10)
+        img = cv2.adaptiveThreshold(
             img, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY,
-            blockSize=31,
-            C=10,
+            blockSize=31, C=10,
         )
+        img = self._deskew(img)
+        return Image.fromarray(img)
+
+    @staticmethod
+    def _to_cv(image: Image.Image) -> np.ndarray:
+        return cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+
+    @staticmethod
+    def _upscale(img: np.ndarray) -> np.ndarray:
+        h, w = img.shape[:2]
+        if max(h, w) < 1200:
+            scale = 1200 / max(h, w)
+            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        return img
 
     @staticmethod
     def _deskew(img: np.ndarray) -> np.ndarray:
-        """Rotate the image to correct skew using the Hough line transform."""
         coords = np.column_stack(np.where(img > 0))
         if coords.size == 0:
             return img
@@ -196,24 +150,20 @@ class ImagePreprocessor:
         if abs(angle) < 0.5:
             return img
         h, w = img.shape[:2]
-        centre = (w // 2, h // 2)
-        M = cv2.getRotationMatrix2D(centre, angle, 1.0)
+        M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
         return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
 
 
 # ---------------------------------------------------------------------------
-# Document Loader  (image + multi-page PDF)
+# Document Loader
 # ---------------------------------------------------------------------------
 
 
 class DocumentLoader:
-    """
-    Converts any supported input file (image or PDF) into a list of
-    PIL Image objects — one per page / frame.
-    """
+    """Loads a PDF or image file and returns a list of PIL Images (one per page)."""
 
-    SUPPORTED_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
-    SUPPORTED_PDF_EXT = {".pdf"}
+    IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
+    PDF_EXTS   = {".pdf"}
 
     def __init__(self, dpi: int = 300) -> None:
         self.dpi = dpi
@@ -222,41 +172,23 @@ class DocumentLoader:
         path = Path(file_path)
         if not path.exists():
             raise FileNotFoundError(f"File not found: {path}")
-
         ext = path.suffix.lower()
+        if ext in self.IMAGE_EXTS:
+            return [Image.open(path).convert("RGB")]
+        if ext in self.PDF_EXTS:
+            return self._pdf_to_images(path)
+        raise ValueError(f"Unsupported file type: '{ext}'")
 
-        if ext in self.SUPPORTED_IMAGE_EXT:
-            return self._load_image(path)
-        if ext in self.SUPPORTED_PDF_EXT:
-            return self._load_pdf(path)
-
-        raise ValueError(f"Unsupported file type '{ext}'. Supported: {self.SUPPORTED_IMAGE_EXT | self.SUPPORTED_PDF_EXT}")
-
-    # ------------------------------------------------------------------
-    def _load_image(self, path: Path) -> list[Image.Image]:
-        logger.info("Loading image: %s", path.name)
-        img = Image.open(path).convert("RGB")
-        return [img]
-
-    def _load_pdf(self, path: Path) -> list[Image.Image]:
-        logger.info("Loading PDF: %s (%s pages)", path.name, self._pdf_page_count(path))
+    def _pdf_to_images(self, path: Path) -> list[Image.Image]:
         doc = fitz.open(str(path))
-        pages: list[Image.Image] = []
-        mat = fitz.Matrix(self.dpi / 72, self.dpi / 72)  # 72 DPI is PDF default
-        for page_num, page in enumerate(doc):
+        mat = fitz.Matrix(self.dpi / 72, self.dpi / 72)
+        pages = []
+        for page in doc:
             pix = page.get_pixmap(matrix=mat, alpha=False)
-            img_data = pix.tobytes("png")
-            pages.append(Image.open(io.BytesIO(img_data)).convert("RGB"))
-            logger.debug("  Rendered PDF page %d", page_num + 1)
+            pages.append(Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB"))
         doc.close()
+        logger.info("PDF loaded — %d page(s)", len(pages))
         return pages
-
-    @staticmethod
-    def _pdf_page_count(path: Path) -> int:
-        doc = fitz.open(str(path))
-        n = doc.page_count
-        doc.close()
-        return n
 
 
 # ---------------------------------------------------------------------------
@@ -265,49 +197,36 @@ class DocumentLoader:
 
 
 class OCREngine:
-    """
-    Wraps Tesseract via pytesseract to extract raw text from preprocessed
-    page images.  Returns a single consolidated text string.
-    """
+    """Runs Tesseract OCR on preprocessed page images."""
 
-    TESSERACT_CONFIG = "--oem 3 --psm 6"  # LSTM engine, assume uniform block text
+    CONFIG = "--oem 3 --psm 6"
 
     def __init__(self, lang: str = "eng") -> None:
         self.lang = lang
         self.preprocessor = ImagePreprocessor()
 
     def extract_text(self, pages: list[Image.Image]) -> str:
-        """Return concatenated OCR text for all pages."""
-        parts: list[str] = []
+        parts = []
         for i, page in enumerate(pages):
-            logger.info("OCR — processing page %d / %d", i + 1, len(pages))
+            logger.info("OCR — page %d / %d", i + 1, len(pages))
             clean = self.preprocessor.preprocess(page)
-            text = pytesseract.image_to_string(clean, lang=self.lang, config=self.TESSERACT_CONFIG)
+            text  = pytesseract.image_to_string(clean, lang=self.lang, config=self.CONFIG)
             parts.append(text)
-        combined = "\n\n---PAGE BREAK---\n\n".join(parts)
-        logger.debug("OCR raw output length: %d chars", len(combined))
-        return combined
-
-    def extract_text_bytes(self, image_bytes: bytes, mime: str = "image/png") -> str:
-        """Convenience: accept raw bytes instead of a PIL Image."""
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        return self.extract_text([img])
+        return "\n\n---PAGE BREAK---\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
-# OpenAI Structured Extraction Service
+# AI Extraction Service
 # ---------------------------------------------------------------------------
 
 
 _SYSTEM_PROMPT = """
-You are an expert document parser specialised in packing lists for camps,
-travel, schools, and expeditions.
+You are an expert document parser for packing lists (camps, travel, schools, expeditions).
 
 Your job:
-1. Read the raw OCR text provided by the user.
+1. Read the OCR text provided.
 2. Extract ALL items, categories, quantities, and notes.
-3. Return ONLY a valid JSON object matching the schema below — no markdown fences,
-   no commentary, just the raw JSON.
+3. Return ONLY a valid JSON object — no markdown, no commentary.
 
 JSON Schema:
 {
@@ -318,7 +237,7 @@ JSON Schema:
   "is_system":   true,
   "categories": [
     {
-      "name":       string,       // UPPER CASE label
+      "name":       string,
       "sort_order": integer,
       "items": [
         {
@@ -333,51 +252,31 @@ JSON Schema:
 }
 
 Rules:
-- Infer categories from context (CLOTHING, TOILETRIES, LINENS, UNIFORMS, EQUIPMENT,
-  ACCESSORIES, MISCELLANEOUS, or any other logical group you detect).
-- Normalise item names (title case, no stray symbols).
-- Parse quantities written as words ("two", "a pair", "1 pr") → integers.
-- If quantity is ambiguous or absent, use null.
-- Mark items as is_required: false only if the text explicitly says optional /
-  recommended / suggested.
-- Ignore headers, footers, page numbers, and decorative text.
-- Consolidate duplicate items across pages.
-- Produce clean, backend-ready JSON.
+- Detect categories from context (CLOTHING, TOILETRIES, LINENS, UNIFORMS, EQUIPMENT, ACCESSORIES, MISCELLANEOUS, or any other logical group).
+- Normalise item names to title case, remove stray symbols.
+- Parse word quantities ("two", "a pair", "1 pr") → integers.
+- Quantity absent or unclear → null.
+- is_required: false ONLY when text says optional / recommended / suggested.
+- Ignore headers, footers, page numbers, decorative text.
+- Consolidate duplicates across pages.
 """.strip()
 
 
-class OpenAIExtractionService:
-    """
-    Sends OCR text + optionally a vision image to OpenAI and returns a
-    validated PackingList instance.
-    """
+class AIExtractionService:
+    """Sends OCR text (+ optional vision page) to OpenAI and returns a validated PackingList."""
 
-    MODEL = "gpt-4o"
+    MODEL      = "gpt-4o"
     MAX_TOKENS = 4096
 
     def __init__(self, api_key: Optional[str] = None) -> None:
         key = api_key or os.getenv("OPENAI_API_KEY")
         if not key:
-            raise EnvironmentError(
-                "OPENAI_API_KEY is not set. Add it to your .env file or pass api_key=."
-            )
+            raise EnvironmentError("OPENAI_API_KEY not set. Add it to .env")
         self.client = OpenAI(api_key=key)
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def extract(
-        self,
-        ocr_text: str,
-        vision_pages: Optional[list[Image.Image]] = None,
-    ) -> PackingList:
-        """
-        Run extraction.  If vision_pages is provided the first page is sent
-        alongside the OCR text for multimodal context.
-        """
-        messages = self._build_messages(ocr_text, vision_pages)
-        logger.info("Sending request to OpenAI (%s)…", self.MODEL)
+    def extract(self, ocr_text: str, vision_page: Optional[Image.Image] = None) -> PackingList:
+        messages = self._build_messages(ocr_text, vision_page)
+        logger.info("Calling OpenAI %s…", self.MODEL)
         response = self.client.chat.completions.create(
             model=self.MODEL,
             messages=messages,
@@ -385,123 +284,60 @@ class OpenAIExtractionService:
             temperature=0.1,
             response_format={"type": "json_object"},
         )
-        raw_json = response.choices[0].message.content or "{}"
-        logger.info("OpenAI response received (%d chars)", len(raw_json))
-        return self._parse_and_validate(raw_json)
+        raw = response.choices[0].message.content or "{}"
+        logger.info("Response received — %d chars", len(raw))
+        return self._validate(raw)
 
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
-
-    def _build_messages(
-        self,
-        ocr_text: str,
-        vision_pages: Optional[list[Image.Image]],
-    ) -> list[dict]:
+    def _build_messages(self, ocr_text: str, vision_page: Optional[Image.Image]) -> list[dict]:
         user_content: list[dict] = [
             {
                 "type": "text",
-                "text": (
-                    f"Here is the OCR-extracted text from the packing list document.\n\n"
-                    f"<ocr_text>\n{ocr_text[:12_000]}\n</ocr_text>\n\n"
-                    "Please extract the structured packing list JSON."
-                ),
+                "text": f"<ocr_text>\n{ocr_text[:12_000]}\n</ocr_text>\n\nExtract the packing list JSON.",
             }
         ]
-
-        # Attach first page as vision context when available
-        if vision_pages:
-            b64 = self._pil_to_b64(vision_pages[0])
-            user_content.insert(
-                0,
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"},
-                },
-            )
-
+        if vision_page:
+            b64 = self._to_b64(vision_page)
+            user_content.insert(0, {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"},
+            })
         return [
             {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
+            {"role": "user",   "content": user_content},
         ]
 
     @staticmethod
-    def _pil_to_b64(image: Image.Image, max_size: int = 1500) -> str:
-        """Resize + encode PIL image to base64 PNG string."""
-        image.thumbnail((max_size, max_size), Image.LANCZOS)
+    def _to_b64(image: Image.Image, max_px: int = 1500) -> str:
+        image.thumbnail((max_px, max_px), Image.LANCZOS)
         buf = io.BytesIO()
         image.save(buf, format="PNG")
         return base64.b64encode(buf.getvalue()).decode()
 
     @staticmethod
-    def _parse_and_validate(raw_json: str) -> PackingList:
-        """Parse raw JSON string and validate against Pydantic schema."""
+    def _validate(raw: str) -> PackingList:
         try:
-            data = json.loads(raw_json)
-        except json.JSONDecodeError as exc:
-            logger.error("JSON decode failed: %s\nRaw: %s", exc, raw_json[:500])
-            raise ValueError(f"OpenAI returned invalid JSON: {exc}") from exc
-
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"AI returned invalid JSON: {e}") from e
         try:
             return PackingList(**data)
-        except Exception as exc:
-            logger.error("Pydantic validation failed: %s", exc)
-            raise ValueError(f"Schema validation error: {exc}") from exc
+        except Exception as e:
+            raise ValueError(f"Schema validation failed: {e}") from e
 
 
 # ---------------------------------------------------------------------------
-# Response Formatter
-# ---------------------------------------------------------------------------
-
-
-class ResponseFormatter:
-    """
-    Converts a validated PackingList model to a plain Python dict or
-    a formatted JSON string suitable for API responses / logging.
-    """
-
-    @staticmethod
-    def to_dict(packing_list: PackingList) -> dict:
-        return packing_list.model_dump(mode="json")
-
-    @staticmethod
-    def to_json(packing_list: PackingList, indent: int = 2) -> str:
-        return json.dumps(ResponseFormatter.to_dict(packing_list), indent=indent, ensure_ascii=False)
-
-    @staticmethod
-    def summary(packing_list: PackingList) -> str:
-        total_items = sum(len(c.items) for c in packing_list.categories)
-        lines = [
-            f"Title       : {packing_list.title}",
-            f"Season      : {packing_list.season or '—'}",
-            f"Categories  : {len(packing_list.categories)}",
-            f"Total items : {total_items}",
-        ]
-        for cat in packing_list.categories:
-            lines.append(f"  [{cat.name}] — {len(cat.items)} items")
-        return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# PackingListAI  — Main Facade (public SDK entry-point)
+# PackingListAI — Main Entry Point
 # ---------------------------------------------------------------------------
 
 
 class PackingListAI:
     """
-    Production-ready facade for the packing list extraction pipeline.
+    Main extraction engine.
 
-    Usage (backend integration)::
-
+    Usage:
         extractor = PackingListAI()
-        result = extractor.process_file("sample.pdf")
-        # result is a plain dict — drop straight into FastAPI / Django response
-
-    Optional kwargs:
-        api_key         — OpenAI key (defaults to OPENAI_API_KEY env var)
-        use_vision      — send first page as vision context (default True)
-        ocr_lang        — Tesseract language code (default "eng")
-        return_model    — return Pydantic model instead of dict (default False)
+        result    = extractor.process_file("sample.pdf")
+        print(result)   # plain dict
     """
 
     def __init__(
@@ -511,95 +347,28 @@ class PackingListAI:
         ocr_lang: str = "eng",
     ) -> None:
         self.use_vision = use_vision
-        self.loader = DocumentLoader()
-        self.ocr = OCREngine(lang=ocr_lang)
-        self.extractor = OpenAIExtractionService(api_key=api_key)
-        self.formatter = ResponseFormatter()
-        logger.info("PackingListAI initialised (vision=%s, lang=%s)", use_vision, ocr_lang)
+        self.loader     = DocumentLoader()
+        self.ocr        = OCREngine(lang=ocr_lang)
+        self.ai         = AIExtractionService(api_key=api_key)
+        logger.info("PackingListAI ready")
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def process_file(
-        self,
-        file_path: Union[str, Path],
-        return_model: bool = False,
-    ) -> Union[dict, PackingList]:
+    def process_file(self, file_path: Union[str, Path]) -> dict:
         """
-        Full pipeline: load → OCR → AI extraction → validate → format.
+        Load file → OCR → AI extraction → return clean dict.
 
-        Args:
-            file_path    : Path to a PDF or image file.
-            return_model : If True, return the Pydantic PackingList model.
-                           If False (default), return a plain dict.
-
-        Returns:
-            dict (or PackingList) with the extracted packing list data.
-
-        Raises:
-            FileNotFoundError : file_path does not exist.
-            ValueError        : unsupported file type or extraction failed.
-            EnvironmentError  : OPENAI_API_KEY missing.
+        Accepts: PDF, JPG, PNG, BMP, TIFF, WebP
         """
-        path = Path(file_path)
-        logger.info("=== Processing file: %s ===", path.name)
-
-        # Stage 1 — Load document into page images
+        path  = Path(file_path)
         pages = self.loader.load(path)
-        logger.info("Loaded %d page(s)", len(pages))
+        logger.info("Loaded %d page(s) from %s", len(pages), path.name)
 
-        # Stage 2 — OCR
-        ocr_text = self.ocr.extract_text(pages)
+        ocr_text    = self.ocr.extract_text(pages)
+        vision_page = pages[0] if self.use_vision else None
+        result      = self.ai.extract(ocr_text, vision_page=vision_page)
 
-        # Stage 3 — AI structured extraction
-        vision_pages = pages if self.use_vision else None
-        packing_list = self.extractor.extract(ocr_text, vision_pages=vision_pages)
-
-        logger.info("Extraction complete.\n%s", self.formatter.summary(packing_list))
-
-        if return_model:
-            return packing_list
-        return self.formatter.to_dict(packing_list)
-
-    def process_bytes(
-        self,
-        data: bytes,
-        filename: str,
-        return_model: bool = False,
-    ) -> Union[dict, PackingList]:
-        """
-        Same pipeline but accepts raw bytes (e.g. from an HTTP upload).
-
-        Args:
-            data     : Raw file bytes.
-            filename : Original filename — used to determine file type.
-
-        Returns:
-            dict (or PackingList) with the extracted packing list data.
-        """
-        suffix = Path(filename).suffix.lower()
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp.write(data)
-            tmp_path = Path(tmp.name)
-
-        try:
-            return self.process_file(tmp_path, return_model=return_model)
-        finally:
-            tmp_path.unlink(missing_ok=True)
-
-    def process_image_object(
-        self,
-        image: Image.Image,
-        return_model: bool = False,
-    ) -> Union[dict, PackingList]:
-        """
-        Accept a pre-loaded PIL Image directly (useful for in-memory pipelines).
-        """
-        pages = [image]
-        ocr_text = self.ocr.extract_text(pages)
-        vision_pages = pages if self.use_vision else None
-        packing_list = self.extractor.extract(ocr_text, vision_pages=vision_pages)
-        if return_model:
-            return packing_list
-        return self.formatter.to_dict(packing_list)
+        logger.info(
+            "Done — %d categories, %d items",
+            len(result.categories),
+            sum(len(c.items) for c in result.categories),
+        )
+        return result.model_dump(mode="json")
